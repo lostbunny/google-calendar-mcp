@@ -1,6 +1,34 @@
 import { OAuth2Client } from 'google-auth-library';
 import * as fs from 'fs/promises';
+import { spawn } from 'child_process';
 import { getKeysFilePath, generateCredentialsErrorMessage, OAuthCredentials } from './utils.js';
+import { CRED_SOURCE, OP_PATH, OP_VAULT, OP_OAUTH_ITEM } from './credentialConfig.js';
+
+// --- 1Password helpers (used when CRED_SOURCE === 'manager') ---
+
+/** Wraps `op read <ref>` — returns trimmed value or null on failure */
+const opRead = (ref: string): Promise<string | null> => new Promise((resolve) => {
+  const proc = spawn(OP_PATH, ['read', ref]);
+  let out = '';
+  proc.stdout.on('data', (d: Buffer) => { out += d; });
+  proc.on('close', (code) => resolve(code === 0 ? out.trim() || null : null));
+  proc.on('error', () => resolve(null));
+});
+
+/** Reads client_id and client_secret from 1Password */
+const get1PasswordCredentials = async (): Promise<OAuthCredentials | null> => {
+  const clientId     = await opRead(`op://${OP_VAULT}/${OP_OAUTH_ITEM}/username`);
+  const clientSecret = await opRead(`op://${OP_VAULT}/${OP_OAUTH_ITEM}/password`);
+  if (!clientId || !clientSecret) return null;
+  return {
+    client_id: clientId,
+    client_secret: clientSecret,
+    redirect_uris: ['http://localhost:3000/oauth2callback'],
+  };
+};
+
+// Export opRead so tokenManager can use it for refresh tokens
+export { opRead };
 
 async function loadCredentialsFromFile(): Promise<OAuthCredentials> {
   const keysContent = await fs.readFile(getKeysFilePath(), "utf-8");
@@ -23,7 +51,19 @@ async function loadCredentialsFromFile(): Promise<OAuthCredentials> {
 }
 
 async function loadCredentialsWithFallback(): Promise<OAuthCredentials> {
-  // Load credentials from file (CLI param, env var, or default path)
+  // CHANGED: dispatch on CRED_SOURCE — no fallback in manager mode
+  if (CRED_SOURCE === 'manager') {
+    const creds = await get1PasswordCredentials();
+    if (!creds) {
+      throw new Error(
+        'Failed to load OAuth credentials from 1Password. ' +
+        'Check OP_VAULT and OP_OAUTH_ITEM env vars and ensure op is unlocked.'
+      );
+    }
+    return creds;
+  }
+
+  // ORIGINAL: Load credentials from file (CLI param, env var, or default path)
   try {
     return await loadCredentialsFromFile();
   } catch (fileError) {

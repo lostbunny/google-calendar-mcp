@@ -5,6 +5,20 @@ import { validateAccountId } from './paths.js';
 import { GaxiosError } from 'gaxios';
 import { mkdir } from 'fs/promises';
 import { dirname } from 'path';
+import { CRED_SOURCE, OP_VAULT, OP_ACCOUNTS_FILE } from './credentialConfig.js';
+import { opRead } from './client.js';
+
+/**
+ * Reads OP_ACCOUNTS_FILE — maps account names to 1Password item names.
+ * Only used when CRED_SOURCE === 'manager'.
+ */
+async function loadAccountsConfig(): Promise<Array<{ account: string; item: string }>> {
+  if (!OP_ACCOUNTS_FILE) {
+    throw new Error('OP_ACCOUNTS_FILE env var is required in manager mode');
+  }
+  const content = await fs.readFile(OP_ACCOUNTS_FILE, 'utf-8');
+  return JSON.parse(content);
+}
 
 // Cached calendar info
 interface CachedCalendar {
@@ -84,11 +98,26 @@ export class TokenManager {
   }
 
   private async writeTokenFile(tokens: MultiAccountTokens): Promise<void> {
+    // ORIGINAL: wrote all account tokens as JSON to this.tokenPath (tokens.json)
+    if (CRED_SOURCE === 'manager') return; // access tokens are memory-only; refresh tokens are in 1Password
     await this.ensureTokenDirectoryExists();
     await fs.writeFile(this.tokenPath, JSON.stringify(tokens, null, 2), { mode: 0o600 });
   }
 
   private async loadMultiAccountTokens(): Promise<MultiAccountTokens> {
+    // ORIGINAL: read tokens.json from disk, migrated legacy single-account format if needed
+    if (CRED_SOURCE === 'manager') {
+      const accounts = await loadAccountsConfig();
+      const result: MultiAccountTokens = {};
+      for (const { account, item } of accounts) {
+        const refreshToken = await opRead(`op://${OP_VAULT}/${item}/password`);
+        if (refreshToken) {
+          result[account] = { refresh_token: refreshToken };
+        }
+      }
+      return result;
+    }
+
     try {
       const fileContent = await fs.readFile(this.tokenPath, "utf-8");
       const parsed = JSON.parse(fileContent);
@@ -118,6 +147,9 @@ export class TokenManager {
    * Used for atomic read-modify-write operations where we need to re-read current state.
    */
   private async loadMultiAccountTokensRaw(): Promise<MultiAccountTokens> {
+    // In manager mode, delegate to the 1Password-aware loader
+    if (CRED_SOURCE === 'manager') return this.loadMultiAccountTokens();
+
     try {
       const fileContent = await fs.readFile(this.tokenPath, "utf-8");
       return JSON.parse(fileContent) as MultiAccountTokens;
@@ -161,6 +193,19 @@ export class TokenManager {
   private setupTokenRefreshForAccount(client: OAuth2Client, accountId: string): void {
     client.on("tokens", async (newTokens) => {
       try {
+        // ORIGINAL: merged newTokens into the account's slot in tokens.json and wrote the file
+        if (CRED_SOURCE === 'manager') {
+          if (newTokens.refresh_token) {
+            throw new Error(
+              `A new refresh token was issued for account "${accountId}". ` +
+              `Update the 1Password item for this account with the new token and restart the server. ` +
+              `New token: ${newTokens.refresh_token}`
+            );
+          }
+          // access token updated in memory via oauth2Client.setCredentials — no disk write needed
+          return;
+        }
+
         // Wrap entire read-modify-write in the queue to prevent race conditions
         await this.enqueueTokenWrite(async () => {
           const multiAccountTokens = await this.loadMultiAccountTokens();
@@ -192,6 +237,9 @@ export class TokenManager {
   }
 
   private async migrateLegacyTokens(): Promise<boolean> {
+    // ORIGINAL: migrated .gcp-saved-tokens.json to the new secure path
+    if (CRED_SOURCE === 'manager') return false; // no legacy migration needed
+
     const legacyPath = getLegacyTokenPath();
     try {
       // Check if legacy tokens exist
@@ -229,17 +277,20 @@ export class TokenManager {
 
   async loadSavedTokens(): Promise<boolean> {
     try {
-      await this.ensureTokenDirectoryExists();
-      
-      // Check if current token file exists
-      const tokenExists = await fs.access(this.tokenPath).then(() => true).catch(() => false);
-      
-      // If no current tokens, try to migrate from legacy location
-      if (!tokenExists) {
-        const migrated = await this.migrateLegacyTokens();
-        if (!migrated) {
-          process.stderr.write(`No token file found at: ${this.tokenPath}\n`);
-          return false;
+      // In manager mode, tokens come from 1Password — skip file checks and migration
+      if (CRED_SOURCE !== 'manager') {
+        await this.ensureTokenDirectoryExists();
+
+        // Check if current token file exists
+        const tokenExists = await fs.access(this.tokenPath).then(() => true).catch(() => false);
+
+        // If no current tokens, try to migrate from legacy location
+        if (!tokenExists) {
+          const migrated = await this.migrateLegacyTokens();
+          if (!migrated) {
+            process.stderr.write(`No token file found at: ${this.tokenPath}\n`);
+            return false;
+          }
         }
       }
 
@@ -350,6 +401,14 @@ export class TokenManager {
   }
 
   async saveTokens(tokens: Credentials, email?: string): Promise<void> {
+    // ORIGINAL: merged tokens into tokens.json for the current account
+    if (CRED_SOURCE === 'manager') {
+      // In manager mode, only set credentials in memory — never write to disk
+      this.oauth2Client.setCredentials(tokens);
+      process.stderr.write(`Tokens loaded in memory for ${this.accountMode} account (manager mode — no disk write)\n`);
+      return;
+    }
+
     try {
         // Wrap entire read-modify-write in the queue to prevent race conditions
         await this.enqueueTokenWrite(async () => {
@@ -373,9 +432,15 @@ export class TokenManager {
   }
 
   async clearTokens(): Promise<void> {
-    try {
-      this.oauth2Client.setCredentials({}); // Clear in memory
+    // ORIGINAL: deleted the account from tokens.json (or the file if last account)
+    this.oauth2Client.setCredentials({}); // Clear in memory
 
+    if (CRED_SOURCE === 'manager') {
+      process.stderr.write(`Tokens cleared in memory for ${this.accountMode} account (manager mode — no disk write)\n`);
+      return;
+    }
+
+    try {
       // Wrap entire read-modify-write in the queue to prevent race conditions
       await this.enqueueTokenWrite(async () => {
         const multiAccountTokens = await this.loadMultiAccountTokens();
@@ -478,7 +543,11 @@ export class TokenManager {
           validateAccountId(accountId);
 
           // Skip invalid token entries
-          if (!tokens || typeof tokens !== 'object' || !tokens.access_token) {
+          // In manager mode, accounts may only have refresh_token (no access_token yet)
+          if (!tokens || typeof tokens !== 'object') {
+            continue;
+          }
+          if (!tokens.access_token && !tokens.refresh_token) {
             continue;
           }
 
